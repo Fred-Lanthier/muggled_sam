@@ -66,7 +66,11 @@ class SAMV3MemoryEncoder(nn.Module):
     # .................................................................................................................
 
     def forward(
-        self, lowres_image_encoding: Tensor, mask_prediction: Tensor, object_score: Tensor, is_prompt_encoding=False
+        self,
+        lowres_image_encoding: Tensor,
+        mask_prediction: Tensor,
+        object_score: Tensor | None,
+        is_prompt_encoding: bool = False,
     ) -> Tensor:
         """
         Takes the lowest-resolution image encoding and combines it
@@ -103,7 +107,8 @@ class SAMV3MemoryEncoder(nn.Module):
         memory_encoding = self.out_proj(memory_encoding)
 
         # Special encoding for missing objects (specific to version 2.1)
-        memory_encoding = self.missing_obj_encoder(memory_encoding, object_score)
+        if object_score is not None:
+            memory_encoding = self.missing_obj_encoder(memory_encoding, object_score)
 
         return memory_encoding
 
@@ -134,7 +139,7 @@ class NoObjectEncoder(nn.Module):
 
         Shapes for reference:
           memory_encoding is expected to have shape: BxCxHxW
-          object_score has shape: Bx1
+          object_score has shape: B
           additive component has shape: 1xC
           output has same shape as memory_encoding (BxCxHxW)
 
@@ -144,7 +149,7 @@ class NoObjectEncoder(nn.Module):
 
         # Add embedding to every pixel of memory encoding if no object is present, otherwise 'add' zero
         # -> This is done in a somewhat strange way to account for batching!
-        no_object_present = (object_score < 0.0).to(dtype=self.no_object_embed.dtype)
+        no_object_present = (object_score[:, None] < 0.0).to(dtype=self.no_object_embed.dtype)
         additive_embed_bchw = (no_object_present * self.no_object_embed).unsqueeze(-1).unsqueeze(-1)
         return memory_encoding + additive_embed_bchw.expand(*memory_encoding.shape)
 

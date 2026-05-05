@@ -77,7 +77,7 @@ class SAMV1MaskDecoder(nn.Module):
         self,
         encoded_image_bchw: Tensor,
         encoded_prompts_bnc: Tensor,
-        grid_positional_encoding: Tensor,
+        image_posenc_bchw: Tensor,
         mask_hint: Tensor | None = None,
         blank_promptless_output=True,
     ) -> tuple[Tensor, Tensor]:
@@ -105,24 +105,29 @@ class SAMV1MaskDecoder(nn.Module):
 
         # For clarity
         batch_size_prompts, num_prompts, enc_dim = encoded_prompts_bnc.shape
+        batch_size_image = encoded_image_bchw.shape[0]
 
-        # Special case, return blank masks if no prompt is given
-        if blank_promptless_output and (num_prompts == 0) and (mask_hint is None):
-            return self.maskgen.make_blank_results(encoded_image_bchw, batch_size_prompts)
+        # Handle batched inputs
+        if batch_size_image > 1 or batch_size_prompts > 1:
+            if batch_size_prompts == 1:
+                encoded_prompts_bnc = encoded_prompts_bnc.expand(batch_size_image, -1, -1)
+            if batch_size_image == 1:
+                encoded_image_bchw = encoded_image_bchw.expand(batch_size_prompts, -1, -1, -1)
+                image_posenc_bchw = image_posenc_bchw.expand(batch_size_prompts, -1, -1, -1)
+            batch_size_prompts, batch_size_image = encoded_prompts_bnc.shape[0], encoded_image_bchw.shape[0]
+            assert (
+                batch_size_prompts == batch_size_image
+            ), "Batch size mismatch! Cannot use different image/prompt batch sizes"
 
         # Concatenate learned 'cls' tokens to prompts
         cls_tokens = torch.cat([self.cls_iou_token, self.cls_mask_tokens], dim=0).unsqueeze(0)
         cls_tokens = cls_tokens.expand(batch_size_prompts, -1, -1)
         num_cls_tokens = cls_tokens.shape[1]
 
-        # Expand per-image data in batch direction to be per-mask, as well as the position encoding
-        img_tokens_bchw = self.maskhint_encoder(encoded_image_bchw, mask_hint)
-        img_tokens_bchw = torch.repeat_interleave(img_tokens_bchw, batch_size_prompts, dim=0)
-        img_posenc_bchw = torch.repeat_interleave(grid_positional_encoding, batch_size_prompts, dim=0)
-
         # Cross-encode image tokens with prompt tokens
+        img_tokens_bchw = self.maskhint_encoder(encoded_image_bchw, mask_hint)
         prompt_tokens = torch.cat((cls_tokens, encoded_prompts_bnc), dim=1)
-        prompt_tokens, img_tokens_bchw = self.transformer(prompt_tokens, img_tokens_bchw, img_posenc_bchw)
+        prompt_tokens, img_tokens_bchw = self.transformer(prompt_tokens, img_tokens_bchw, image_posenc_bchw)
 
         # Extract the (now-encoded) 'cls' tokens by undoing the earlier cls concatenation step
         encoded_cls_tokens = prompt_tokens[:, :num_cls_tokens, :]
@@ -132,6 +137,12 @@ class SAMV1MaskDecoder(nn.Module):
         # Produce final output mask & quality predictions
         mask_preds = self.maskgen(img_tokens_bchw, mask_tokens_out)
         iou_preds = self.iou_token_mlp(iou_token_out)
+
+        # Special case. Wipe out outputs if no prompt is given
+        if blank_promptless_output and (num_prompts == 0) and (mask_hint is None):
+            mask_preds = 0 * mask_preds - 100.0
+            iou_preds = 0 * iou_preds
+            encoded_cls_tokens = 0 * encoded_cls_tokens
 
         return mask_preds, iou_preds, encoded_cls_tokens
 
@@ -198,28 +209,6 @@ class MaskGen(nn.Module):
 
         # Take dot product (along channel dimension) of cls tokens with image patches for final masks
         return torch.einsum("bnc, bchw -> bnhw", encoded_mask_tokens, upscaled_img_tokens)
-
-    # .................................................................................................................
-
-    def make_blank_results(self, image_tokens_bchw: Tensor, batch_size_prompts: int) -> tuple[Tensor, Tensor, Tensor]:
-        """Helper used to generate a 'blank' mask, meant for cases where inputs aren't available"""
-
-        # For clarity
-        _, c, h, w = image_tokens_bchw.shape
-
-        # Due to upscaler layer, the normal mask output should be 4 times larger than the image encoding size!
-        mask_h, mask_w = (4 * h, 4 * w)
-        mask_shape = (batch_size_prompts, 4, mask_h, mask_w)
-        iou_shape = (batch_size_prompts, 4)
-        cls_shape = (batch_size_prompts, 5, c)
-
-        # Fill in empty mask and IoU prediction values
-        device, dtype = self.device_info.device, self.device_info.dtype
-        blank_mask_preds = torch.full(mask_shape, -100, device=device, dtype=dtype, requires_grad=False)
-        blank_iou_preds = torch.ones(iou_shape, device=device, dtype=dtype, requires_grad=False)
-        blank_cls_tokens = torch.zeros(cls_shape, device=device, dtype=dtype, requires_grad=False)
-
-        return blank_mask_preds, blank_iou_preds, blank_cls_tokens
 
     # .................................................................................................................
 

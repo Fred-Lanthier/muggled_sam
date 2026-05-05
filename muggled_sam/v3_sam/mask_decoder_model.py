@@ -74,13 +74,16 @@ class SAMV3MaskDecoder(nn.Module):
         self.iou_token_mlp = MLP3Layers(input_channels, num_mask_tokens, use_sigmoid_output=True)
         self.objptrgen = ObjectPointerGen(input_channels)
 
+        # Special-case downsampler for making 'mask hints' used to produce object pointers from mask prompts
+        self.mask_to_ptr_hint_downsampler = nn.Conv2d(1, 1, kernel_size=4, stride=4)
+
     # .................................................................................................................
 
     def forward(
         self,
         encoded_image_tokens_list_bchw: Tensor,
         encoded_prompts_bnc: Tensor,
-        grid_positional_encoding: Tensor,
+        image_posenc_bchw: Tensor,
         mask_hint: Tensor | int | None = None,
         blank_promptless_output: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -112,26 +115,31 @@ class SAMV3MaskDecoder(nn.Module):
         # For clarity
         batch_size_prompts, num_prompts, enc_dim = encoded_prompts_bnc.shape
         lowres_tokens, hires_tokens_x2, hires_tokens_x4 = encoded_image_tokens_list_bchw
+        batch_size_image = lowres_tokens.shape[0]
 
-        # Special case, return blank masks if no prompt is given
-        if blank_promptless_output and (num_prompts == 0) and (mask_hint is None):
-            mask_preds, iou_preds = self.maskgen.make_blank_results(lowres_tokens, batch_size_prompts)
-            obj_score, obj_ptrs = self.objptrgen.make_blank_results(self.cls_mask_tokens, batch_size_prompts)
-            return mask_preds, iou_preds, obj_ptrs, obj_score
+        # Handle batched inputs
+        if batch_size_image > 1 or batch_size_prompts > 1:
+            if batch_size_prompts == 1:
+                encoded_prompts_bnc = encoded_prompts_bnc.expand(batch_size_image, -1, -1)
+            if batch_size_image == 1:
+                lowres_tokens = lowres_tokens.expand(batch_size_prompts, -1, -1, -1)
+                hires_tokens_x2 = hires_tokens_x2.expand(batch_size_prompts, -1, -1, -1)
+                hires_tokens_x4 = hires_tokens_x4.expand(batch_size_prompts, -1, -1, -1)
+                image_posenc_bchw = image_posenc_bchw.expand(batch_size_prompts, -1, -1, -1)
+            batch_size_prompts, batch_size_image = encoded_prompts_bnc.shape[0], lowres_tokens.shape[0]
+            assert (
+                batch_size_prompts == batch_size_image
+            ), "Batch size mismatch! Cannot use different image/prompt batch sizes"
 
         # Concatenate learned 'cls' tokens to prompts
         cls_tokens = torch.cat([self.cls_obj_token, self.cls_iou_token, self.cls_mask_tokens], dim=0)
         cls_tokens = cls_tokens.unsqueeze(0).expand(batch_size_prompts, -1, -1)
         num_cls_tokens = cls_tokens.shape[1]
 
-        # Expand per-image data in batch direction to be per-mask, as well as the position encoding
-        img_tokens_bchw = self.maskhint_encoder(lowres_tokens, mask_hint)
-        img_tokens_bchw = torch.repeat_interleave(img_tokens_bchw, batch_size_prompts, dim=0)
-        img_posenc_bchw = torch.repeat_interleave(grid_positional_encoding, batch_size_prompts, dim=0)
-
         # Cross-encode image tokens with prompt tokens
+        img_tokens_bchw = self.maskhint_encoder(lowres_tokens, mask_hint)
         prompt_tokens = torch.cat((cls_tokens, encoded_prompts_bnc), dim=1)
-        encoded_prompt_tokens, encoded_img_tokens = self.transformer(prompt_tokens, img_tokens_bchw, img_posenc_bchw)
+        encoded_prompt_tokens, encoded_img_tokens = self.transformer(prompt_tokens, img_tokens_bchw, image_posenc_bchw)
 
         # Extract the (now-encoded) 'cls' tokens by undoing the earlier cls concatenation step
         encoded_cls_tokens = encoded_prompt_tokens[:, :num_cls_tokens, :]
@@ -140,13 +148,20 @@ class SAMV3MaskDecoder(nn.Module):
         mask_tokens_out = encoded_cls_tokens[:, 2:, :]
 
         # Produce final output mask & quality predictions
-        mask_preds = self.maskgen(encoded_img_tokens, hires_tokens_x2, hires_tokens_x4, mask_tokens_out)
-        iou_preds = self.iou_token_mlp(iou_token_out)
+        mask_preds_bnhw = self.maskgen(encoded_img_tokens, hires_tokens_x2, hires_tokens_x4, mask_tokens_out)
+        iou_preds_bn = self.iou_token_mlp(iou_token_out)
 
         # Generate 'object pointer' output
-        obj_score, obj_ptrs = self.objptrgen(obj_token_out, mask_tokens_out)
+        obj_score_b1, obj_ptrs_bnc = self.objptrgen(obj_token_out, mask_tokens_out)
 
-        return mask_preds, iou_preds, obj_ptrs, obj_score
+        # Special case. Wipe out outputs if no prompt is given
+        if blank_promptless_output and (num_prompts == 0) and (mask_hint is None):
+            mask_preds_bnhw = 0 * mask_preds_bnhw - 100.0
+            iou_preds_bn = 0 * iou_preds_bn
+            obj_ptrs_bnc = 0 * obj_ptrs_bnc
+            obj_score_b1 = 0 * obj_score_b1 - 10
+
+        return mask_preds_bnhw, iou_preds_bn, obj_ptrs_bnc, obj_score_b1
 
     # .................................................................................................................
 
@@ -159,7 +174,7 @@ class SAMV3MaskDecoder(nn.Module):
 
     @staticmethod
     def get_best_decoder_results(
-        mask_preds: Tensor, iou_preds: Tensor, obj_ptrs: Tensor, exclude_0th_index: bool = True
+        mask_preds_bnhw: Tensor, iou_preds_bn: Tensor, obj_ptrs_bnc: Tensor, exclude_0th_index: bool = True
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Helper used to keep only the 'best' result from the mask decoder predictions.
@@ -171,20 +186,79 @@ class SAMV3MaskDecoder(nn.Module):
             -> Best index is a tensor (!) with shape: B (i.e. 1 index for each batch entry)
             -> Mask prediction has shape: Bx1xHxW
             -> IoU has shape: Bx1
-            -> Object pointer has shape: Bx1xF (F features, 256 by default)
+            -> Object pointer has shape: Bx1xC (C features, 256 by default)
         """
 
-        # Use highest iou prediction as indicator of the 'best' results
-        # -> Optionally exclude the 0th index, which is normally used when multiple-prompts are given
-        best_idx = 1 + torch.argmax(iou_preds[:, 1:], dim=-1) if exclude_0th_index else torch.argmax(iou_preds, dim=-1)
+        # Each mask prediction contains multiple (4 by default) options, here we select which to use
+        b_idx = torch.arange(mask_preds_bnhw.shape[0], device=iou_preds_bn.device)
+        best_n_idx = 1 + iou_preds_bn[:, 1:].argmax(dim=-1) if exclude_0th_index else iou_preds_bn.argmax(dim=-1)
 
-        best_mask_pred = mask_preds[:, best_idx, :, :]
-        best_iou_pred = iou_preds[:, best_idx]
-        best_obj_ptr = obj_ptrs[:, best_idx, :]
+        # Index out best entries, while accounting for batch dimension
+        best_mask_b1hw = mask_preds_bnhw[b_idx, best_n_idx].unsqueeze(1)
+        best_iou_pred_b = iou_preds_bn[b_idx, best_n_idx]
+        best_objptr_b1c = obj_ptrs_bnc[b_idx, best_n_idx].unsqueeze(1)
 
-        return best_idx, best_mask_pred, best_iou_pred, best_obj_ptr
+        return best_n_idx, best_mask_b1hw, best_iou_pred_b, best_objptr_b1c
 
     # .................................................................................................................
+
+    def make_pointer_from_mask(
+        self,
+        encoded_image_tokens_list_bchw: Tensor,
+        padding_point_prompt_b1c: Tensor,
+        image_posenc_bchw: Tensor,
+        mask_b1hw: Tensor,
+    ) -> Tensor:
+        """
+        Awkward helper used specifically for encoding masks used to generate object pointers
+        when initializing SAM video tracking using a mask (as opposed to using a prompt).
+        Expects the 'v2' (aka video) image encodings as an input!
+
+        In practice, making a 'blank' pointer (e.g. all zeros) works fine or even just not making
+        a pointer at all, however this is included for compatibility with the original code:
+        https://github.com/facebookresearch/sam3/blob/86ed77094094e5cabb16b0414ec60c5ba9ce0a0f/sam3/model/sam3_tracker_base.py#L412
+        https://github.com/facebookresearch/sam3/blob/86ed77094094e5cabb16b0414ec60c5ba9ce0a0f/sam3/model/sam3_tracker_base.py#L961-L967
+
+        Returns:
+            object_pointers_b1c ('B' matching input masks)
+        """
+
+        # Resize mask to prepare for special downsample step
+        mask_binary = (mask_b1hw > 0).to(device=mask_b1hw.device, dtype=mask_b1hw.dtype)
+        mask_b, mask_n, mask_h, mask_w = mask_b1hw.shape
+        upscaled_mask = nn.functional.interpolate(
+            mask_binary, size=(4 * mask_h, 4 * mask_w), mode="bilinear", align_corners=False
+        )
+
+        # Move multi-channel inputs to batch dimension if needed (for compatibility with convolution weights)
+        if mask_n > 1 and mask_b == 1:
+            upscaled_mask = upscaled_mask.permute(1, 0, 2, 3)
+            mask_b, mask_n, mask_h, mask_w = upscaled_mask.shape
+        assert mask_n == 1, f"Expecting single channel mask, e.g. Bx1xHxW, got shape: {tuple(upscaled_mask.shape)}"
+
+        # Make sure the padding batch size matches mask input
+        pad_b, pad_n, pad_c = padding_point_prompt_b1c.shape
+        if mask_b > 1 and pad_b == 1:
+            padding_point_prompt_b1c = padding_point_prompt_b1c.expand(mask_b, -1, -1)
+            pad_b, pad_n, pad_c = padding_point_prompt_b1c.shape
+        assert pad_b == mask_b, f"Error expecting prompt batch ({pad_b}) to match mask count ({mask_b})"
+
+        # Run 'regular' mask decoder using special mask hint to get object pointers
+        ptr_mask_hint = self.mask_to_ptr_hint_downsampler(upscaled_mask)
+        _, iou_preds_bn, obj_ptrs_bnc, _ = self(
+            encoded_image_tokens_list_bchw,
+            padding_point_prompt_b1c,
+            image_posenc_bchw,
+            mask_hint=ptr_mask_hint,
+            blank_promptless_output=False,
+        )
+
+        # Pick 'best' pointer for each multiplex/batch entry
+        best_n_idx = 1 + torch.argmax(iou_preds_bn[:, 1:], dim=-1)
+        m_idx = torch.arange(iou_preds_bn.shape[0], device=iou_preds_bn.device, dtype=torch.int64)
+        obj_ptrs_b1c = obj_ptrs_bnc[m_idx, best_n_idx].unsqueeze(1)
+
+        return obj_ptrs_b1c
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -262,26 +336,6 @@ class MaskGen(nn.Module):
 
         # Take dot product (along channel dimension) of cls tokens with image patches for final masks
         return torch.einsum("bnc, bchw -> bnhw", encoded_mask_tokens, upscaled_img_tokens)
-
-    # .................................................................................................................
-
-    def make_blank_results(self, image_tokens_bchw: Tensor, batch_size_of_prompts: int) -> tuple[Tensor, Tensor]:
-        """Helper used to generate a 'blank' mask, meant for cases where inputs aren't available"""
-
-        # For clarity
-        _, c, h, w = image_tokens_bchw.shape
-
-        # Due to upscaler layer, the normal mask output should be 4 times larger than the image encoding size!
-        mask_h, mask_w = (4 * h, 4 * w)
-        mask_shape = (batch_size_of_prompts, 4, mask_h, mask_w)
-        iou_shape = (batch_size_of_prompts, 4)
-
-        # Fill in empty mask and IoU prediction values
-        device, dtype = self.device_info.device, self.device_info.dtype
-        blank_mask_preds = torch.full(mask_shape, -100, device=device, dtype=dtype, requires_grad=False)
-        blank_iou_preds = torch.ones(iou_shape, device=device, dtype=dtype, requires_grad=False)
-
-        return blank_mask_preds, blank_iou_preds
 
     # .................................................................................................................
 
@@ -431,7 +485,7 @@ class ObjectPointerGen(nn.Module):
 
         # Projection layers to convert encoded tokens to score & pointer
         # -> The 'no_ptr' parameter is the pointer given for low object scores
-        self.no_ptr = nn.Parameter(torch.zeros(1, features_per_token))
+        self.no_ptr_embed = nn.Parameter(torch.zeros(1, 1, features_per_token))
         self.score_mlp = MLP3Layers(features_per_token, 1)
         self.pointer_mlp = MLP3Layers(features_per_token, features_per_token)
 
@@ -456,31 +510,20 @@ class ObjectPointerGen(nn.Module):
 
         Returns:
             object_score, object_pointers
-            -> score shape is: Bx1
+            -> score shape is: B (e.g. 1 number per batch)
             -> pointer shape is: Bx4xF
             -> For B batch size, F features per token (256 by default)
         """
 
         # Compute object score (indicator of whether there is a valid object being masked)
-        objscore = self.score_mlp(encoded_object_token)
+        objscore_b = self.score_mlp(encoded_object_token).squeeze(-1)
 
-        # Get pointer for each batch
-        objptrs_list = []
-        for batch_idx in range(encoded_mask_tokens.shape[0]):
-            tokens = encoded_mask_tokens[batch_idx]
-            ptr = self.pointer_mlp(tokens) if objscore[batch_idx] > 0 else self.no_ptr.expand_as(tokens)
-            objptrs_list.append(ptr)
-        objptrs = torch.stack(objptrs_list)
+        # Get pointers for each batch (implemented in a bit of a strange way to support compilation)
+        ptrs_bnc = self.pointer_mlp(encoded_mask_tokens)
+        is_ok_score = (objscore_b > 0).to(dtype=ptrs_bnc.dtype)
+        objptrs_bnc = ptrs_bnc * is_ok_score + (1 - is_ok_score) * self.no_ptr_embed
 
-        return objscore, objptrs
-
-    # .................................................................................................................
-
-    def make_blank_results(self, mask_tokens: Tensor, batch_size_of_prompts: int) -> tuple[Tensor, Tensor]:
-        """Helper used to produce 'no object' output when needing blank results"""
-        no_obj_score = torch.tensor(-10).to(mask_tokens)
-        no_obj_ptr = self.no_ptr.expand_as(mask_tokens).expand(batch_size_of_prompts, -1, -1)
-        return no_obj_score, no_obj_ptr
+        return objscore_b, objptrs_bnc
 
     # .................................................................................................................
 

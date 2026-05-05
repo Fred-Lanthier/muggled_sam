@@ -180,7 +180,7 @@ class SAMV3Model(nn.Module):
         image_bgr: ndarray,
         max_side_length: int | None = None,
         use_square_sizing: bool = True,
-    ) -> tuple[list[Tensor], tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[list[Tensor], list[Tensor]], tuple[int, int], tuple[int, int]]:
         """
         Function used to compute image encodings from a bgr formatted image (e.g. loaded from opencv)
         The max_side_length setting is used to set the size at which the image is processed, if
@@ -190,10 +190,13 @@ class SAMV3Model(nn.Module):
 
         Returns:
             encoded_images_list, patch_grid_hw, preencoded_image_hw
-            -> Encoded images list contains 3 multi-resolution feature maps
-               they have shapes: Bx256x72x72, Bx64x144x144, Bx32x288x288
-               (using default settings). The first-most feature map is
-               the 'low-res' map needed by several other parts of the model
+            -> Encoded images list contains 2 sets of multi-resolution
+               feature maps, which correspond to SAMv2 or SAMv3 tasks.
+               Each entry is itself contains 3 tensors where are
+               multiresolution image features. The 0th entry is always
+               the lowest resolution map with the 1st and 2nd index
+               entries being 2x and 4x larger.
+               Note, the v2 & v3 entries have different channel counts!
             -> The patch_grid_hw contains the height & width of the low-res
                feature map (72x72 with default 1008x1008 input sizing)
             -> The preencoded_image_hw contains the height & width of the
@@ -204,10 +207,10 @@ class SAMV3Model(nn.Module):
         with _inference_mode(self._infmode):
             image_rgb_normalized_bchw = self.image_encoder.prepare_image(image_bgr, max_side_length, use_square_sizing)
             encoded_img = self.image_encoder(image_rgb_normalized_bchw)
-            encoded_image_features_list = self.image_projection.v2_projection(encoded_img)
+            encoded_image_features_list = self.image_projection(encoded_img)
 
         # Get patch sizing of lowest-res tokens (as needed by other components) & size of processed image
-        patch_grid_hw = encoded_image_features_list[0].shape[2:]
+        patch_grid_hw = encoded_image_features_list[0][0].shape[2:]
         image_preenc_hw = image_rgb_normalized_bchw.shape[2:]
 
         return encoded_image_features_list, patch_grid_hw, image_preenc_hw
@@ -216,7 +219,7 @@ class SAMV3Model(nn.Module):
 
     def generate_masks(
         self,
-        encoded_image_features_list: list[Tensor],
+        encoded_image_features_list: tuple[list[Tensor], list[Tensor]],
         encoded_prompts: Tensor,
         mask_hint: Tensor | int | None = None,
         blank_promptless_output: bool = True,
@@ -243,12 +246,13 @@ class SAMV3Model(nn.Module):
         """
 
         # Get sizing of the lowest-resolution image encoding
-        patch_grid_hw = encoded_image_features_list[0].shape[2:]
+        v2_encimgs = encoded_image_features_list[0]
+        patch_grid_hw = v2_encimgs[0].shape[2:]
 
         with _inference_mode(self._infmode):
             grid_posenc = self.coordinate_encoder.get_grid_position_encoding(patch_grid_hw)
             mask_preds, iou_preds, obj_ptrs, obj_score = self.mask_decoder(
-                encoded_image_features_list, encoded_prompts, grid_posenc, mask_hint, blank_promptless_output
+                v2_encimgs, encoded_prompts, grid_posenc, mask_hint, blank_promptless_output
             )
 
         return mask_preds, iou_preds
@@ -257,7 +261,7 @@ class SAMV3Model(nn.Module):
 
     def initialize_video_masking(
         self,
-        encoded_image_features_list: list[Tensor],
+        encoded_image_features_list: tuple[list[Tensor], list[Tensor]],
         box_tlbr_norm_list: list,
         fg_xy_norm_list: list,
         bg_xy_norm_list: list,
@@ -286,13 +290,14 @@ class SAMV3Model(nn.Module):
         with _inference_mode(self._infmode):
 
             # For convenience
-            lowres_imgenc, *hires_imgenc = encoded_image_features_list
+            v2_encimgs = encoded_image_features_list[0]
+            lowres_imgenc, *hires_imgenc = v2_encimgs
             token_hw = lowres_imgenc.shape[2:]
 
             # Generate mask prediction from image/prompt encodings, as usual
             grid_posenc = self.coordinate_encoder.get_grid_position_encoding(token_hw)
             mask_preds, iou_preds, obj_ptrs, obj_score = self.mask_decoder(
-                encoded_image_features_list,
+                v2_encimgs,
                 encoded_prompts,
                 grid_posenc,
                 mask_hint=mask_hint,
@@ -312,7 +317,11 @@ class SAMV3Model(nn.Module):
 
     # .................................................................................................................
 
-    def initialize_from_mask(self, encoded_image_features_list: list[Tensor], mask_image: ndarray | Tensor) -> Tensor:
+    def initialize_from_mask(
+        self,
+        encoded_image_features_list: tuple[list[Tensor], list[Tensor]],
+        mask_image: ndarray | Tensor,
+    ) -> tuple[Tensor, Tensor]:
         """
         Alternate video tracking initialization option. In this case, using a provided mask image as a 'prompt'
         to begin tracking an object.
@@ -332,71 +341,72 @@ class SAMV3Model(nn.Module):
         - If a mask is given with 4 dimensions, it will be interpretted as: Bx1xHxW, where it
           must have size '1' in the second-most dimension.
 
-        Note that with this form of initializtion, there is no object pointer! The pointer normally
-        comes from the mask prediction, so without a prediction, there is no pointer. The video
-        masking should therefore be initialized with only the memory encoding and an empty pointer list.
-        This doesn't have a substantial impact on the tracking
-
         Returns:
-            memory_encoding
+            memory_encoding, object_pointer
         """
 
         with _inference_mode(self._infmode):
 
             # For convenience
-            lowres_imgenc, *hires_imgenc = encoded_image_features_list
+            v2_encimgs = encoded_image_features_list[0]
+            lowres_imgenc, *hires_imgenc = v2_encimgs
             device, dtype = lowres_imgenc.device, lowres_imgenc.dtype
-            token_h, token_w = lowres_imgenc.shape[2:]
-
-            # Hard-code the object score as being 'high/confident', since we assume the given mask is accurate
-            obj_score = torch.tensor(100.0, device=device, dtype=dtype)
+            token_hw = lowres_imgenc.shape[2:]
 
             # Force input into a boolean mask & convert to torch tensor
             if isinstance(mask_image, ndarray):
-                if mask_image.dtype != np.bool:
-                    mask_image = mask_image > 0
                 mask_tensor = torch.tensor(mask_image, device=device, dtype=dtype)
             elif isinstance(mask_image, Tensor):
-                if mask_image.dtype != torch.bool:
-                    mask_image = mask_image > 0
                 mask_tensor = mask_image.to(device=device, dtype=dtype)
             assert isinstance(mask_tensor, Tensor), "Unsupported mask type! Must be a numpy array or torch tensor"
 
             # Make sure we get a mask with shape: BxNxHxW
             if mask_tensor.ndim == 2:
-                # Convert HxW -> 1x1xHxW
-                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  #  HxW -> 1x1xHxW
             elif mask_tensor.ndim == 3 and mask_tensor.shape[-1] <= 3:
-                # Convert (opencv image format) HxWxC -> 1x1xHxW
-                mask_tensor = mask_tensor[:, :, 0].unsqueeze(0).unsqueeze(0)
+                mask_tensor = mask_tensor[:, :, 0].unsqueeze(0).unsqueeze(0)  # HxWxC -> 1x1xHxW
             elif mask_tensor.ndim == 3:
-                # Convert BxHxW -> Bx1xHxW
-                mask_tensor = mask_tensor.unsqueeze(1)
-            assert (
-                mask_tensor.ndim == 4 and mask_tensor.shape[1] == 1
-            ), "Unsupported mask shape, must be: HxW, HxWxC, BxHxW or Bx1xHxW"
+                mask_tensor = mask_tensor.unsqueeze(1)  # BxHxW -> Bx1xHxW
+            assert mask_tensor.ndim == 4, "Unsupported mask shape, must be: HxW, HxWxC, BxHxW or Bx1xHxW"
 
-            # Scale input to correct size before encoding
-            mask_tensor = nn.functional.interpolate(mask_tensor, size=(4 * token_h, 4 * token_w))
-            memory_encoding = self.memory_encoder(lowres_imgenc, mask_tensor, obj_score, is_prompt_encoding=True)
+            # Try to force into Bx1xHxW shape
+            mask_b, mask_n, mask_h, mask_w = mask_tensor.shape
+            if mask_b == 1 and mask_n > 1:
+                mask_tensor = mask_tensor.permute(1, 0, 2, 3)
+                mask_b, mask_n, mask_h, mask_w = mask_tensor.shape
+            assert mask_tensor.shape[1] == 1, "Mask shape error! Expecting '1' in shape index 1, eg. Bx1xHxW"
 
-        return memory_encoding
+            # Make special-case pointer from mask, since we don't normally get one without prompting
+            # https://github.com/facebookresearch/sam3/blob/86ed77094094e5cabb16b0414ec60c5ba9ce0a0f/sam3/model/sam3_tracker_base.py#L412
+            pad_prompt_enc = self.prompt_encoder.create_padding_point_encoding()
+            grid_posenc = self.coordinate_encoder.get_grid_position_encoding(token_hw)
+            ptrs_b1c = self.mask_decoder.make_pointer_from_mask(v2_encimgs, pad_prompt_enc, grid_posenc, mask_tensor)
+
+            # Generate memory encoding from mask
+            memory_encoding = self.memory_encoder(lowres_imgenc, mask_tensor, None, is_prompt_encoding=True)
+
+        return memory_encoding, ptrs_b1c
 
     # .................................................................................................................
 
     def step_video_masking(
         self,
-        encoded_image_features_list: list[Tensor],
+        encoded_image_features_list: tuple[list[Tensor], list[Tensor]],
         prompt_memory_encodings: list[Tensor],
         prompt_object_pointers: list[Tensor],
         previous_memory_encodings: list[Tensor],
         previous_object_pointers: list[Tensor],
+        num_multiplex_objects: int = 1,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Function which makes segmentation predictions for consecutive frames of
         an input video. It takes in the encoded video frame data along with prior
         prompt/previous frame memory data in order to automatically continue
         segmenting some existing object (i.e. without requiring user prompts).
+
+        Note:
+        The 'num_multiplex_objects' is a dummy input included for compatibility
+        with the v3.1 update. It doesn't do anything!
 
         This function corresponds to 'track_step' in the SAMv3 implementation:
         https://github.com/facebookresearch/sam3/blob/757bbb0206a0b68bee81b17d7eb4877177025b2f/sam3/model/sam3_tracker_base.py#L930
@@ -420,7 +430,8 @@ class SAMV3Model(nn.Module):
             # Encode image features with previous memory encodings & object pointer data
             # Called '_prepare_memory_conditioned_features' in original code
             # See: https://github.com/facebookresearch/sam3/blob/757bbb0206a0b68bee81b17d7eb4877177025b2f/sam3/model/sam3_tracker_base.py#L971
-            lowres_imgenc, *hires_imgenc = encoded_image_features_list
+            v2_encimgs = encoded_image_features_list[0]
+            lowres_imgenc, *hires_imgenc = v2_encimgs
             memfused_encimg = self.memory_image_fusion(
                 lowres_imgenc,
                 prompt_memory_encodings,
@@ -470,6 +481,34 @@ class SAMV3Model(nn.Module):
     def check_have_prompts(self, box_tlbr_norm_list, fg_xy_norm_list, bg_xy_norm_list) -> bool:
         """Helper used to check if there are any prompts"""
         return self.prompt_encoder.check_have_prompts(box_tlbr_norm_list, fg_xy_norm_list, bg_xy_norm_list)
+
+    # .................................................................................................................
+
+    def prepare_image_batch(
+        self,
+        images_bgr_list: list[ndarray],
+        max_side_length: int | None = None,
+        use_square_sizing: bool = True,
+    ) -> Tensor:
+        """
+        Helper used to convert BGR image (from opencv) into the tensor format needed for image encoding
+        Expects a list of numpy arrays (BGR images) as input. Returns a single tensor of shape: BxCxHxW
+        """
+
+        # Prepare each image individually
+        img_tensors_list = []
+        for image_bgr in images_bgr_list:
+            img_tensor_bchw = self.image_encoder.prepare_image(image_bgr, max_side_length, use_square_sizing)
+            img_tensors_list.append(img_tensor_bchw)
+
+        # Check that all images have the same size if square sizing isn't used
+        if not use_square_sizing:
+            all_h_list = [img.shape[2] for img in img_tensors_list]
+            all_w_list = [img.shape[3] for img in img_tensors_list]
+            assert all(all_h_list[0] == h for h in all_h_list), "Mismatched image heights (different aspect ratios)"
+            assert all(all_w_list[0] == w for w in all_w_list), "Mismatched image widths (different aspect ratios)"
+
+        return torch.concat(img_tensors_list, dim=0)
 
     # .................................................................................................................
 
@@ -574,7 +613,7 @@ class SAMV3DetectorModel(nn.Module):
         image_bgr: ndarray,
         max_side_length: int | None = None,
         use_square_sizing: bool = True,
-    ) -> tuple[list[Tensor], tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[list[Tensor], list[Tensor]], tuple[int, int], tuple[int, int]]:
         """
         Function used to compute image encodings from a bgr formatted image (e.g. loaded from opencv)
         The max_side_length setting is used to set the size at which the image is processed, if
@@ -582,14 +621,15 @@ class SAMV3DetectorModel(nn.Module):
         The use_square_sizing setting determines whether the image is scaled to a square resolution
         or scaled (to the max_side_length) based on it's original aspect ratio.
 
-        IMPORTANT:
-            This function produces *different* results from the .encode_image(...)
-            function that is part of the base model, though the outputs have the same structure.
-
         Returns:
-            encoded_detection_images_list, patch_grid_hw, preencoded_image_hw
-            -> Encoded detection images list contains 3 multi-resolution feature maps
-               they have shapes: Bx256x72x72, Bx256x144x144, Bx256x288x288 (using default settings)
+            encoded_images_list, patch_grid_hw, preencoded_image_hw
+            -> Encoded images list contains 2 sets of multi-resolution
+               feature maps, which correspond to SAMv2 or SAMv3 tasks.
+               Each entry is itself contains 3 tensors where are
+               multiresolution image features. The 0th entry is always
+               the lowest resolution map with the 1st and 2nd index
+               entries being 2x and 4x larger.
+               Note, the v2 & v3 entries have different channel counts!
             -> The patch_grid_hw contains the height & width of the low-res
                feature map (72x72 with default 1008x1008 input sizing)
             -> The preencoded_image_hw contains the height & width of the
@@ -600,10 +640,10 @@ class SAMV3DetectorModel(nn.Module):
         with _inference_mode(self._infmode):
             image_rgb_normalized_bchw = self.image_encoder.prepare_image(image_bgr, max_side_length, use_square_sizing)
             encoded_img = self.image_encoder(image_rgb_normalized_bchw)
-            encoded_image_features_list = self.image_projection.v3_projection(encoded_img)
+            encoded_image_features_list = self.image_projection(encoded_img)
 
         # Get patch sizing of lowest-res tokens (as needed by other components) & size of processed image
-        patch_grid_hw = encoded_image_features_list[0].shape[2:]
+        patch_grid_hw = encoded_image_features_list[0][0].shape[2:]
         image_preenc_hw = image_rgb_normalized_bchw.shape[2:]
 
         return encoded_image_features_list, patch_grid_hw, image_preenc_hw
@@ -612,7 +652,7 @@ class SAMV3DetectorModel(nn.Module):
 
     def encode_exemplars(
         self,
-        encoded_image_features_list: list[Tensor],
+        encoded_image_features_list: tuple[list[Tensor], list[Tensor]],
         text: str | None = None,
         box_xy1xy2_norm_list: list[tuple[tuple[float, float], tuple[float, float]]] | None = None,
         point_xy_norm_list: list[tuple[float, float]] | None = None,
@@ -648,7 +688,8 @@ class SAMV3DetectorModel(nn.Module):
         """
 
         # For clarity
-        lowres_imgenc_bchw = encoded_image_features_list[0]
+        v3_encimgs = encoded_image_features_list[1]
+        lowres_imgenc_bchw = v3_encimgs[0]
         img_b, img_c, _, _ = lowres_imgenc_bchw.shape
 
         with _inference_mode(self._infmode):
@@ -684,7 +725,7 @@ class SAMV3DetectorModel(nn.Module):
 
     def generate_detections(
         self,
-        encoded_image_features_list: list[Tensor],
+        encoded_image_features_list: tuple[list[Tensor], list[Tensor]],
         encoded_exemplars_bnc: Tensor,
         detection_filter_threshold: float = 0.0,
         exemplar_padding_mask_bn: Tensor | None = None,
@@ -725,17 +766,25 @@ class SAMV3DetectorModel(nn.Module):
         """
 
         # For clarity
-        lowres_imgenc_bchw, hiresx2_imgenc_bchw, hiresx4_imgenc_bchw = encoded_image_features_list
+        v3_encimgs = encoded_image_features_list[1]
+        lowres_imgenc_bchw, hiresx2_imgenc_bchw, hiresx4_imgenc_bchw = v3_encimgs
 
         with _inference_mode(self._infmode):
 
             # Return 'blank' results if we don't get any exemplars
             # -> Not required (model still works with no exemplars), but blanked results make more sense
-            no_exemplars = encoded_exemplars_bnc.shape[1] == 0
+            exm_b, exm_n, _ = encoded_exemplars_bnc.shape
+            no_exemplars = exm_n == 0
             if no_exemplars and blank_no_exemplar_outputs:
                 blk_tok, blk_box, blk_score, blk_pres = self.exemplar_detector.create_blank_output(lowres_imgenc_bchw)
                 blk_masks, _ = self.exemplar_segmentation.create_blank_output(blk_tok, lowres_imgenc_bchw)
                 return blk_masks, blk_box, blk_score, blk_pres
+
+            # Batch image encodings if exemplars are batched
+            if exm_b > 1 and lowres_imgenc_bchw.shape[0] == 1:
+                lowres_imgenc_bchw = lowres_imgenc_bchw.expand(exm_b, -1, -1, -1)
+                hiresx2_imgenc_bchw = hiresx2_imgenc_bchw.expand(exm_b, -1, -1, -1)
+                hiresx4_imgenc_bchw = hiresx4_imgenc_bchw.expand(exm_b, -1, -1, -1)
 
             # Mix exemplar data into image tokens
             fused_imgexm_tokens_bchw = self.image_exemplar_fusion(
@@ -806,48 +855,6 @@ class SAMV3DetectorModel(nn.Module):
         filtered_scores = detection_scores[is_valid_detection]
 
         return filtered_masks, filtered_boxes, filtered_scores, presence_score
-
-    # .................................................................................................................
-
-    def encode_tracking_and_detection_image(
-        self,
-        image_bgr: ndarray,
-        max_side_length: int | None = None,
-        use_square_sizing: bool = True,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        ***Special case function***
-
-        This function is used to compute both the image encodings needed for tracking
-        AND the features for detections, from a bgr formatted input image (e.g. loaded from opencv).
-        It is purely for optimization purposes when combining SAMv3 detections with video tracking.
-
-        This is equivalent to running .encode_image(...) and .encode_detection_image(...)
-        using the SAMv3 model and detection variant (respectively). However, this approach
-        is much more efficient, as the heaviest part of this encoding can be shared between
-        both outputs, so only needs to be computed once.
-
-        Note that the return format is slightly different from the original encoding functions!
-
-        Returns:
-            encoded_tracking_features_list, encoded_detection_features_list
-
-        -> Both outputs contain 3 multi-resolution feature maps
-        -> The tracking features have shapes: Bx256xHxW, Bx64x(2H)x(2W) & Bx32x(4H)x(4W)
-           The detection features have shapes: Bx256xHxW, Bx256x(2H)x(2W) & Bx256x(4H)x(4W)
-        -> Where H & W are the 'low-res' feature map size (72x72 by default)
-
-        The tracking features are the ones used in video tracking (e.g. inside the 'step_video_masking' function)
-        while the detection features are used in the exemplar encoding and generate detections functions.
-        """
-
-        with _inference_mode(self._infmode):
-            image_rgb_normalized_bchw = self.image_encoder.prepare_image(image_bgr, max_side_length, use_square_sizing)
-            encoded_img = self.image_encoder(image_rgb_normalized_bchw)
-            tracking_features_list = self.image_projection.v2_projection(encoded_img)
-            detection_features_list = self.image_projection.v3_projection(encoded_img)
-
-        return tracking_features_list, detection_features_list
 
     # .................................................................................................................
 
@@ -922,7 +929,7 @@ class SAMV3DetectorModel(nn.Module):
 
         if compile_image_encoding:
             self.image_encoder.forward = torch.compile(self.image_encoder.forward, **comp_kwargs)
-            self.image_projection.v3_projection = torch.compile(self.image_projection.v3_projection, **comp_kwargs)
+            self.image_projection.forward = torch.compile(self.image_projection.forward, **comp_kwargs)
 
         if compile_exemplar_encoding:
             self.text_encoder.transformer.forward = torch.compile(

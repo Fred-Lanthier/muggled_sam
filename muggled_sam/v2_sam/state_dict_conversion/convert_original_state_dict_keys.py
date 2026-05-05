@@ -105,6 +105,10 @@ def convert_state_dict_keys(
             layernorm_key_hints = ("downscaler.1", "downscaler.4", "img_patch_upscaler.norm")
             mod_data = _reshape_layernorm2d(new_key, orig_data, *layernorm_key_hints)
 
+            # Reshape to BxNxC (1x1xC) format for no-pointer embedding (originally 1xC)
+            if new_key == "objptrgen.no_ptr_embed":
+                mod_data = mod_data.unsqueeze(0)
+
             _update_sd(SAM2ModuleType.mask_decoder, orig_key, new_key, mod_data)
             continue
 
@@ -133,7 +137,13 @@ def convert_state_dict_keys(
 
         new_key = _convert_memfusion_keys(orig_key)
         if found_key(new_key):
-            _update_sd(SAM2ModuleType.memory_image_fusion, orig_key, new_key, orig_data)
+
+            # Switch from rows-of-tokens (BNC) to image-like shape (BCHW)
+            mod_data = orig_data
+            if "no_mem_embed_bchw" in new_key:
+                mod_data = orig_data.reshape(1, -1, 1, 1)
+
+            _update_sd(SAM2ModuleType.memory_image_fusion, orig_key, new_key, mod_data)
             continue
 
         # Explicity skip some keys, which are not used by MugSAM implementation
@@ -196,11 +206,11 @@ def _convert_imgenc_keys(
 ) -> None | str:
     """Converts keys associated with the image encoder component of the model"""
 
-    # Capture oddly placed hi-res convolution layers on the mask decoder
+    # Capture oddly placed hi-res convolution layers on the mask decoder (move to output projection)
     if key.startswith("sam_mask_decoder.conv_s0"):
-        return key.replace("sam_mask_decoder.conv_s0", "proj_x4")
+        return key.replace("sam_mask_decoder.conv_s0", "output_projection.hires_x4_proj.1")
     if key.startswith("sam_mask_decoder.conv_s1"):
-        return key.replace("sam_mask_decoder.conv_s1", "proj_x2")
+        return key.replace("sam_mask_decoder.conv_s1", "output_projection.hires_x2_proj.1")
 
     # Re-arrange/name positional encoding weights to a different model component
     if key == "image_encoder.trunk.pos_embed":
@@ -231,7 +241,6 @@ def _convert_imgenc_keys(
         # Fix block MLP layer indexing
         orig_block_idx = get_nth_integer(new_key, 0)
         if ".mlp.layers." in new_key:
-            # block_idx = get_nth_integer(new_key, 0)
             mlp_layer_idx = get_nth_integer(new_key, 1)
             new_idx = 2 * mlp_layer_idx
             weight_or_bias = get_suffix_terms(new_key, 1)
@@ -250,7 +259,14 @@ def _convert_imgenc_keys(
     if "neck.convs" in new_key:
         seq_idx = get_nth_integer(new_key, 0)
         weight_or_bias = get_suffix_terms(new_key, 1)
-        return f"output_projection.multires_projs.{seq_idx}.{weight_or_bias}"
+        seq_idx_to_key_lut = {
+            0: "halfres_proj",
+            1: "lowres_x1_proj",
+            2: "hires_x2_proj.0",
+            3: "hires_x4_proj.0",
+        }
+        new_layer_name = seq_idx_to_key_lut[seq_idx]
+        return f"output_projection.{new_layer_name}.{weight_or_bias}"
 
     # Return all other keys with just prefix removed
     return new_key
@@ -324,7 +340,7 @@ def _convert_maskdecoder_keys(key: str) -> None | str:
 
     # Capture object pointer weights (now part of mask decoder, instead of 'parent' model)
     if key == "no_obj_ptr":
-        return "objptrgen.no_ptr"
+        return "objptrgen.no_ptr_embed"
     if key.startswith("obj_ptr_proj"):
         layer_idx = get_nth_integer(key, 0)
         new_idx = 2 * layer_idx
@@ -337,6 +353,10 @@ def _convert_maskdecoder_keys(key: str) -> None | str:
         new_idx = 2 * layer_idx
         weight_or_bias = get_suffix_terms(key, 1)
         return f"objptrgen.score_mlp.layers.{new_idx}.{weight_or_bias}"
+
+    # Handle special mask-to-pointer convolution layer
+    if key.startswith("mask_downsample."):
+        return key.replace("mask_downsample", "mask_to_ptr_hint_downsampler")
 
     # Bail on non-decoder keys
     if not key.startswith("sam_mask_decoder"):
@@ -476,7 +496,7 @@ def _convert_memfusion_keys(key: str) -> None | str:
 
     # Capture 'no_mem_embed' which originally belonged to parent SAM model
     if key == "no_mem_embed":
-        return key
+        return "no_mem_embed_bchw"
 
     # Rename frame position offset embedding
     if key == "maskmem_tpos_enc":
@@ -486,17 +506,17 @@ def _convert_memfusion_keys(key: str) -> None | str:
     if key.startswith("obj_ptr_tpos_proj"):
         return key.replace("obj_ptr_tpos_proj", "memconcat.ptrposenc.pointer_pos_proj")
 
-    # Remove model name prefix
+    # Handle memory attention conversions
     if key.startswith("memory_attention"):
 
-        # Remove memory_attention prefix from all keys
-        new_key = key.removeprefix("memory_attention.")
+        # Update memory attention prefix
+        new_key = key.replace("memory_attention", "fusion_transformer")
 
         # Rename final norm layer for clarity
-        if new_key.startswith("norm"):
+        if new_key.startswith("fusion_transformer.norm"):
             new_key = new_key.replace("norm", "out_norm")
 
-        if new_key.startswith("layers"):
+        if new_key.startswith("fusion_transformer.layers"):
 
             # Handle re-structuring of the fusion transformer layers
             find_and_replace_lut = {

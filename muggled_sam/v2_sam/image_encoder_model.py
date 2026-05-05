@@ -13,7 +13,6 @@ import torch.nn as nn
 
 from .components.hiera_model import HieraModel
 from .components.image_encoder_components import HalfStepPatchEmbed, WindowTiledPositionEncoding, OutputProjection
-from .components.shared import Conv1x1Layer
 
 # For type hints
 from torch import Tensor
@@ -93,10 +92,6 @@ class SAMV2ImageEncoder(nn.Module):
         features_per_stage = self.hiera.get_features_per_stage()
         self.output_projection = OutputProjection(output_channels, features_per_stage)
 
-        # New to version-2, used to process pass-thru features sent to the mask decoder
-        self.proj_x4 = Conv1x1Layer(output_channels, output_channels // 8)
-        self.proj_x2 = Conv1x1Layer(output_channels, output_channels // 4)
-
         # Store image scaling values
         self.register_buffer("mean_rgb", torch.tensor(self.rgb_offset).view(-1, 1, 1), persistent=False)
         self.register_buffer("stdev_scale_rgb", 1.0 / torch.tensor(self.rgb_stdev).view(-1, 1, 1), persistent=False)
@@ -118,7 +113,7 @@ class SAMV2ImageEncoder(nn.Module):
           ->          index-2 shape: 1x32x256x256
 
         Returns:
-            [lowres_features, features_x2, features_x4]
+            lowres_features, features_x2, features_x4
         """
 
         # Prepare image tokens for transformer
@@ -127,12 +122,7 @@ class SAMV2ImageEncoder(nn.Module):
 
         # Encode patches using transformer, then project down to 3 feature maps
         multires_tokens_bchw_list = self.hiera(patch_tokens_bchw)
-        features_list = self.output_projection(multires_tokens_bchw_list)
-
-        # Further process high-res features
-        lowres_features, hires_features_x2, hires_features_x4 = features_list
-        hires_features_x4 = self.proj_x4(hires_features_x4)
-        hires_features_x2 = self.proj_x2(hires_features_x2)
+        lowres_features, hires_features_x2, hires_features_x4 = self.output_projection(multires_tokens_bchw_list)
 
         return lowres_features, hires_features_x2, hires_features_x4
 
@@ -140,17 +130,28 @@ class SAMV2ImageEncoder(nn.Module):
 
     def prepare_image(
         self,
-        image_bgr: ndarray,
+        image_bgr: ndarray | Tensor,
         max_side_length: int | None = None,
         use_square_sizing: bool = True,
-        pad_to_square: bool = False,
     ) -> Tensor:
         """
         Helper used to convert opencv-formatted images (e.g. from loading: cv2.imread(path_to_image)
         into the format needed by the image encoder model (includes scaling and RGB normalization steps)
+
+        Note: As a special case, a image tensor may be provided directly, with shape BxCxHxW.
+        This is meant as a pass-thru option to avoid requiring numpy arrays, but this will
+        skip all pre-processing steps so they must be done manually!
+
         Returns:
             image_as_tensor_bchw
         """
+
+        # Allow tensors as inputs
+        if isinstance(image_bgr, torch.Tensor):
+            image_tensor_bchw = image_bgr.to(device=self.mean_rgb.device, dtype=self.mean_rgb.dtype)
+            if image_tensor_bchw.ndim == 3:
+                image_tensor_bchw = image_tensor_bchw.unsqueeze(0)
+            return image_tensor_bchw
 
         # Fill in default sizing if not given
         if max_side_length is None:
@@ -184,14 +185,6 @@ class SAMV2ImageEncoder(nn.Module):
 
         # Perform mean/scale normalization
         image_tensor_bchw = (image_tensor_bchw - self.mean_rgb) * self.stdev_scale_rgb
-
-        # The original SAM implementation padded the short side of the image to form a square
-        # -> This results in more processing and isn't required in this implementation!
-        if pad_to_square:
-            pad_left, pad_top = 0, 0
-            pad_bottom = max_side_length - scaled_h
-            pad_right = max_side_length - scaled_w
-            image_tensor_bchw = nn.functional.pad(image_tensor_bchw, (pad_left, pad_right, pad_top, pad_bottom))
 
         return image_tensor_bchw
 

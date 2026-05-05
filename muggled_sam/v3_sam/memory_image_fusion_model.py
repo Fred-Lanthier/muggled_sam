@@ -8,8 +8,7 @@
 import torch
 import torch.nn as nn
 
-from .components.memory_image_fusion_components import MemoryImageFusionTransformerLayer, FusionPositionOffset
-from .components.position_encoding import SinusoidalPE2D
+from .components.memory_image_fusion_components import MemoryImageFusionTransformer, FusionPositionOffset
 
 # For type hints
 from torch import Tensor
@@ -46,6 +45,7 @@ class SAMV3MemoryImageFusion(nn.Module):
         features_per_image_token=256,
         features_per_memory_token=64,
         num_layers=4,
+        num_heads=1,
         max_memory_history=6,
     ):
 
@@ -57,19 +57,15 @@ class SAMV3MemoryImageFusion(nn.Module):
         self._num_tokens_per_pointer = features_per_image_token // features_per_memory_token
 
         # Embedding added to encoded image features when not using memory encoding
-        self.no_mem_embed = torch.nn.Parameter(torch.empty(1, 1, features_per_image_token))
+        self.no_mem_embed_bchw = torch.nn.Parameter(torch.empty(1, features_per_image_token, 1, 1))
 
-        # Create models used to help prepare data for transformer layers
+        # Create model used to help prepare data for transformer
         self.memconcat = MemoryConcatenator(features_per_image_token, features_per_memory_token, max_memory_history)
-        self.imgposenc = ImageTokenPositionEncoder(features_per_image_token)
 
-        # Build transformer layers
-        layers_list = []
-        for _ in range(num_layers):
-            layer = MemoryImageFusionTransformerLayer(features_per_image_token, features_per_memory_token, mlp_ratio=8)
-            layers_list.append(layer)
-        self.layers = nn.ModuleList(layers_list)
-        self.out_norm = nn.LayerNorm(features_per_image_token)
+        # Model used to encode memory data into image tokens
+        self.fusion_transformer = MemoryImageFusionTransformer(
+            features_per_image_token, features_per_memory_token, num_layers, num_heads
+        )
 
     # .................................................................................................................
 
@@ -103,9 +99,7 @@ class SAMV3MemoryImageFusion(nn.Module):
 
         # If we're prompting or there is no memory data, do simpler fuse
         if is_prompt_frame or len(prompt_memory_encodings) == 0:
-            no_mem_bchw = self.no_mem_embed.squeeze(0).unsqueeze(-1).unsqueeze(-1)
-            fused_tokens = lowres_image_tokens_bchw + no_mem_bchw
-            return fused_tokens
+            return lowres_image_tokens_bchw + self.no_mem_embed_bchw
 
         # Merge all prior memory data into a single set of tokens
         memory_tokens, memory_posenc, num_ptr_tokens = self.memconcat(
@@ -116,21 +110,11 @@ class SAMV3MemoryImageFusion(nn.Module):
             previous_is_recent_first,
         )
 
-        # Get input shape so we can restore it on output
-        b, _, h, w = lowres_image_tokens_bchw.shape
-        patch_hw = (h, w)
-
-        # Apply position encoding & flatten to rows-of-tokens format, shape: BxNxC
-        image_posenc_tokens = self.imgposenc(lowres_image_tokens_bchw)
-        flat_imgtokens_bnc = image_posenc_tokens.flatten(2).permute(0, 2, 1)
-
-        # Run transformer layers to fuse memory results with image tokens
-        for layer in self.layers:
-            flat_imgtokens_bnc = layer(patch_hw, flat_imgtokens_bnc, memory_tokens, memory_posenc, num_ptr_tokens)
-
-        # Convert back to image-like shape, from: BxNxC -> BxCxHxW
-        flat_imgtokens_bnc = self.out_norm(flat_imgtokens_bnc)
-        return flat_imgtokens_bnc.permute(0, 2, 1).reshape(b, -1, h, w)
+        # Fuse memory results into image tokens
+        fused_img_tokens = self.fusion_transformer(
+            lowres_image_tokens_bchw, memory_tokens, memory_posenc, num_ptr_tokens
+        )
+        return fused_img_tokens
 
     # .................................................................................................................
 
@@ -277,48 +261,6 @@ class MemoryConcatenator(nn.Module):
         memory_posenc = torch.cat(posenc_list, dim=1)
 
         return memory_tokens, memory_posenc, num_ptr_tokens
-
-    # .................................................................................................................
-
-
-class ImageTokenPositionEncoder(nn.Module):
-    """
-    Simple helper used to handle the addition of position encodings
-    to image tokens within the memory fusion model. This module does
-    not exist in the original implementation, but is separated in
-    this repo for the sake of clarity.
-
-    This functionality seems like an odd implementation detail from the
-    original code base, and is the only place where image position encodings
-    are actually used (with default the configs at least), it can be found here:
-    https://github.com/facebookresearch/sam3/blob/757bbb0206a0b68bee81b17d7eb4877177025b2f/sam3/model/decoder.py#L683C17-L683C33
-
-    Removing this behavior (by not running the model or having a weight of 0.0),
-    has very little effect on the output!
-    """
-
-    # .................................................................................................................
-
-    def __init__(self, features_per_image_token=256, position_encoding_weight=0.1):
-        super().__init__()
-        self.posenc = SinusoidalPE2D(features_per_image_token)
-        self._posenc_weight = position_encoding_weight
-        self.register_buffer("cached_posenc_bchw", torch.empty((1, 1, 1, 1)), persistent=False)
-
-    def forward(self, image_tokens_bchw: Tensor) -> Tensor:
-        """
-        Applies (additive) position encoding to image tokens
-        Returns:
-            encoded_image_tokens_bchw (same shape as input)
-        """
-
-        # Re-generate cached position encoding if needed
-        _, _, h, w = image_tokens_bchw.shape
-        cache_h, cache_w = self.cached_posenc_bchw.shape[-2:]
-        if cache_h != h or cache_w != w:
-            self.cached_posenc_bchw = self.posenc(h, w) * self._posenc_weight
-
-        return image_tokens_bchw + self.cached_posenc_bchw
 
     # .................................................................................................................
 

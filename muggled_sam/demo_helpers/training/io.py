@@ -12,7 +12,6 @@ import json
 import torch
 import torch.nn as nn
 import numpy as np
-import cv2
 
 # For type hints
 from typing import Any
@@ -138,6 +137,7 @@ class ShuffleList:
         self._data = initial_data
         self._curr_item_idx = -1
         self._idx_list = list(range(len(initial_data)))
+        self._max_idx = len(self._idx_list) - 1
         if shuffle_on_init and len(initial_data) > 0:
             self.force_shuffle()
         pass
@@ -187,8 +187,13 @@ class ShuffleList:
     def get_next(self, repeat: bool = False) -> tuple[bool, Any]:
 
         # Don't update item indexing if we're repeating an entry
-        if not repeat:
-            self._curr_item_idx += 1
+        if repeat:
+            # Avoid (rare) scenario where we don't have a proper index set
+            # -> Happens if we reshuffle (idx is -1), then do a repeat-read which doesn't increment the index
+            # -> Can get infinite loop if user tries to 'remove previous' when this happens if index isn't forced to 0
+            self._curr_item_idx = max(0, self._curr_item_idx)
+        else:
+            self._curr_item_idx = min(self._curr_item_idx + 1, self._max_idx)
 
         data_idx = self._idx_list[self._curr_item_idx]
         result = self._data[data_idx]
@@ -214,10 +219,12 @@ class ShuffleList:
         # (it remains in the original data however!)
         data_idx = self._idx_list.pop(self._curr_item_idx)
         result = self._data[data_idx]
+        max_idx = len(self._idx_list) - 1
 
         # Correct next index if needed (avoid problems when removing from end of list)
-        max_next_idx = max(0, len(self._idx_list) - 2)
+        max_next_idx = max(0, max_idx - 2)
         self._curr_item_idx = min(self._curr_item_idx, max_next_idx)
+        self._max_idx = max_idx
 
         return result
 
@@ -341,8 +348,8 @@ def save_training_weights(
 
 def get_training_weight_paths(
     root_folder_path: str | Path,
-    base_model_name: str | Path,
-    weight_folder_name: str | Path = "saved_train_weights",
+    base_model_path: str | Path,
+    weight_folder_name: str = "saved_train_weights",
     reverse_sort_paths: bool = True,
 ) -> list[Path]:
     """
@@ -352,8 +359,7 @@ def get_training_weight_paths(
     """
 
     # Build pathing to where we expect training weights to be stored for the given model
-    base_model_name = Path(base_model_name).stem
-    weight_folder_name = Path(weight_folder_name).stem
+    base_model_name = Path(base_model_path).stem
     model_train_folder = Path(root_folder_path) / weight_folder_name / base_model_name
 
     # List out all saved torch files under the training folder

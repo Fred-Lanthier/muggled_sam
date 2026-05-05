@@ -8,48 +8,56 @@ This folder contains several scripts that contain minimal/simplified examples of
 
 ## Auto Mask Generator
 
-_(Supports SAMv1, SAMv2, SAMv3)_
+_(Supports SAMv1, SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/auto_mask_generator.py)
 
 This script runs the SAM model as an 'auto-mask generator', similar to the capability provided by the [original repo implementation](https://github.com/facebookresearch/sam2/blob/2b90b9f5ceec907a1c18123530e92e794ad901a4/sam2/automatic_mask_generator.py#L36). It works by running the SAM model with a (dense) grid of single point prompts to generate masks from all parts of the image, while filtering bad/overlapping results. This version provides a visualization (if enabled in the settings) of the results as they're being generated.
 
 
 ## Image Segmentation
 
-_(Supports SAMv1, SAMv2, SAMv3)_
+_(Supports SAMv1, SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/image_segmentation.py)
 
 This script contains the most basic usage of the SAM models, which is to segment an image based on a set of provided prompts (bounding boxes, foreground points, background points or masks).
 
 ## Image Segmentation with Batches
 
-_(Supports SAMv1, SAMv2, SAMv3)_
+_(Supports SAMv1, SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/image_segmentation_batches.py)
 
-This is an extension of the basic image segmentation script, modified to show how an image batch can be processed. Processing a batch of images is the same as processing multiple images, one after another, except batching can be slightly faster when using a GPU. For simplicity, this example just repeats a single image to form a batch, but normally many images would be loaded in and processed together.
+This is an extension of the basic image segmentation script, modified to show how multiple images can be processed in parallel as a batch. Processing a batch of images is the same as processing multiple images, one after another, except batching can be slightly faster when using a GPU. The main downside of batching is higher VRAM requirements.
 
 
 ## Model Distillation
 
-_(Supports SAMv1, SAMv2, SAMv3)_
+_(Supports SAMv1, SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/model_distillation.py)
 
 This script shows a basic example of how to do model distillation (e.g. unsupervised training). In this case the script does distillation of the image encoder only, but can be easily modified to train other model components. Distillation uses a teacher model (meant to be an original SAM model) to provide 'ground-truth' data for training a student model (meant to be a smaller version of the teacher). Smaller versions of SAMv3 can be made using the [pruning scripts](https://github.com/heyoeyo/muggled_sam/tree/main/training#pruning) of this repo. Training also requires example images, a good source for these is coco128 which can be downloaded from [ultralytics](https://github.com/ultralytics/yolov5/releases/tag/v1.0) (see assets > coco128.zip).
 
 
 ## Object Detection
 
-_(Supports SAMv3)_
+_(Supports SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/object_detection.py)
 
 This script contains the most basic usage of the SAMv3 detection functionality. It allows multiple objects to be detected using a single text prompt or by specifying a part of the image (using points or bounding boxes) as a reference for what to detect.
 
 
+## Object Detection with batches
+
+_(Supports SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/object_detection_batches.py)
+
+This is a variation on the original detection example, showing how to do batched detections. For the sake of simplicity this example batches together text prompts, but it's also possible to batch point/box prompts (it's just messier to define).
+
+Batching is equivalent to running a `for` loop over all prompts, but works by loading everything as a single input and computing all results 'in parallel'. This has the advantage of reducing the amount of CPU-to-GPU communication (slight inference speed up) at the expense of increasing VRAM usage (about 250MB per single word text prompt on float16).
+
 ## Object Detection (cross-image)
 
-_(Supports SAMv3)_
+_(Supports SAMv3)_  - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/object_detection_cross_image.py)
 
 This is a variation of the object detection example where an object from a 'reference' image is used to detect objects in a separate 'target' image.
 
 
 ## Speed Benchmarking
 
-_(Supports SAMv1, SAMv2, SAMv3)_
+_(Supports SAMv1, SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/speed_benchmarking.py)
 
 This script runs each of the image segmentation components repeatedly while timing the average execution speed. It can be used to get a sense of how fast each of the different model variants will run and supports changing the image size used by the model. For example, here are some examples results (using an RTX 3090) for SAMv1, v2 & v3 models at different input image sizes, using bfloat16 & square image sizing:
 
@@ -59,13 +67,15 @@ This script runs each of the image segmentation components repeatedly while timi
 | V1-Large  | 101 ms | 26 ms  | 1.5 ms |
 | V2-Tiny   | 10 ms  | 3.1 ms | 1.6 ms |
 | V2-Large  | 47 ms  | 13 ms  | 1.6 ms |
-| V3        | 148ms  | 39 ms  | 1.5 ms |
+| V3        | 157 ms  | 44 ms  | 1.5 ms |
+| v3.1      | 162 ms  | 45 ms  | 1.5 ms |
 
 | Model | Encoding @ 1008px | Encoding @ 504px | Mask Generation |
 | ----- | ----------------- | ---------------- | --------------- |
-| V3        | 109ms  | 41 ms  | 1.5 ms |
+| V3    | 115 ms  | 43 ms    | 1.5 ms |
+| V3.1  | 119 ms  | 44 ms    | 1.5 ms |
 
-The SAMv3 results are shown for both 1024px and 1008px (it's native default), since the model takes a _significant_ performance hit at the v1/v2 default 1024px sizing. Strangely, it's also consistently slower at 504px vs. 512px.
+The SAMv3/v3.1 results are shown for both 1024px and 1008px (the native resolution of the models), since the model takes a _significant_ performance hit at the v1/v2 default 1024px sizing. It's worth noting that v3 & v3.1 both compute multiple 'projections' when running the image encoder, which are not always needed (depends on how the model is being used). If only one task is needed (e.g. interactive segmentation), it's possible to get a small (~10%) speed up by manually running only the required projection(s).
 
 For reference, here's the VRAM usage (with bfloat16) of various models as reported by [nvidia-smi](https://docs.nvidia.com/deploy/nvidia-smi/index.html) when running this script. All values are in mebibytes (MiB):
 
@@ -78,67 +88,81 @@ For reference, here's the VRAM usage (with bfloat16) of various models as report
 | V2-Small |  724 |  508 |
 | V2-Base+ |  840 |  582 |
 | V2-Large | 1230 |  920 |
-| V3       | 2524 | 2156 |
+| V3       | 2610 | 2176 |
+| V3.1     | 2622 | 2190 |
 
 
 ## Speed Benchmarking (Detections)
 
-_(Supports SAMv3)_
+_(Supports SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/speed_benchmarking_detection.py)
 
-This script repeatedly runs the components associated with SAMv3 object detection while timing the execution speed. The time taken for each of the major steps (image encoding, exemplar encoding and generating detections) is printed out as the script runs. For example, here are the results using an RTX 3090 on bfloat16 running at the default 1008px as well as 504px, with and without compilation for comparison. A single box, point and text prompt are being used in all cases (using more or fewer prompts will affect timing). All times are in milliseconds:
+This script repeatedly runs the components associated with SAMv3 object detection while timing the execution speed. The time taken for each of the major steps (image encoding, exemplar encoding and generating detections) is printed out as the script runs. The table below shows the results using an RTX 3090 on bfloat16 running at the default 1008px as well as 504px, with and without compilation for comparison. A single box, point and text prompt are being used in all cases (using more or fewer prompts will affect timing). All times are in milliseconds:
+
+| Model | Image encoding | Exemplar encoding | Generate detections |
+| ----- | -------------- | ----------------- | ------------------- |
+| V3 @ 1008px            | 115 | 4.2 | 18  |
+| V3 @ 1008px (compiled) | 107 | 3.1 | 12  |
+| V3 @ 504px             | 43  | 4.2 | 6.5 |
+| v3 @ 504px (compiled)  | 35  | 3.1 | 3.7 |
 
 
-| Component |  Time @ 1008px | -> Compiled (1008px) | Time @ 504px | -> Compiled (504px) |
-| --------- | -------------- | -------------------- | ------------ | ------------------- |
-| Image encoding      | 111  | 101 | 41   | 34  |
-| Exemplar encoding   | 4.4  | 3.1 | 4.4  | 3.1 |
-| Generate detections |  18  | 12  | 6.8  | 3.7 |
+As with the masking and video tracking tasks, the image encoder takes up the majority of the inference time when running object detection. Reducing the processing resolution by half gives a slightly better than 2x speed up in inference, and we see that compilation gives around a 10% speed up to the image encoder, with bigger benefits for smaller components. The results for v3.1 are identical to v3.0, except for a slightly slower image encoder due to including an additional projection of the encoded image tokens (see the [image segmentation](https://github.com/heyoeyo/muggled_sam/tree/main/simple_examples#speed-benchmarking) benchmarking above).
 
-As with the masking and video tracking tasks, the image encoder takes up the majority of the inference time when running object detection. Reducing the processing resolution by half gives a slightly better than 2x speed up in inference, and we see that compilation gives around a 10% speed up to the image encoder, with bigger benefits for smaller components.
-
-For reference, nvidia-smi reports VRAM usage as 2530MiB (@1008px, bfloat16) and 2164MiB (@504px, bfloat16). With compilation, this is slightly reduced to 2454MiB and 2140MiB, respectively.
+For reference, nvidia-smi reports VRAM usage as 2530MiB (@1008px, bfloat16) and 2166MiB (@504px, bfloat16). With compilation, this is slightly reduced to 2454MiB and 2140MiB, respectively.
 
 
 ## Video Segmentation
 
-_(Supports SAMv2, SAMv3)_
+_(Supports SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/video_segmentation.py)
 
-This script provides a basic example of how to implement video segmentation using the SAMv2 or v3 model (V1 does not support video segmentation!). For simplicity, this script assumes that tracking begins with a prompt on the first frame of the video, but any frame could be used. It also only stores results for one object, though again this can be changed to handle multiple objects by creating instances of the video storage data for each object.
+This script provides a basic example of how to implement video segmentation using the SAMv2 or v3 model (V1 does not support video segmentation!). For simplicity, this script assumes that tracking begins with a prompt on the first frame of the video, but any frame could be used. It also only stores results for one object, though again this can be changed to handle multiple objects by creating multiple instances of the video storage data for each object.
 
-Segmentation results are displayed per-frame for verification, and the total inference time is also printed out. For example, the table below shows the per-frame inference times for different models while tracking one object at different image sizes using bfloat16 (all other settings are left at defaults):
+Segmentation results are displayed per-frame for verification, and the time required for image encoding as well as a single tracking update (e.g. mask prediction) is also printed out. For example, the tables below show the per-frame inference times for different models while tracking one object at different image sizes using bfloat16 on an RTX 3090 (all other settings are left at defaults):
 
-| Model | Inference @ 1024 | Inference @ 512 |
-| ----- | ---------------- | --------------- |
-| V2-Tiny | 26 ms | 8 ms |
-| V2-Small | 28 ms | 8 ms |
-| V2-Base | 38 ms | 11 ms |
-| V2-Large | 64 ms | 17 ms |
-| V3 | 172ms | 46ms |
+| Model | Encode + Track @ 1024px | Encode + Track @ 512px |
+| ----- | ----------------------- | ---------------------- |
+| V2-Tiny  | 13 + 15 | 5 + 4  |
+| V2-Small | 15 + 15 | 7 + 4  |
+| V2-Base  | 25 + 15 | 9 + 4  |
+| V2-Large | 52 + 15 | 18 + 4 |
 
-| Model | Inference @ 1008 | Inference @ 504 |
-| ----- | ---------------- | --------------- |
-| V3 | 130ms | 47ms |
+| Model | Encode + Track @ 1008px | Encode + Track @ 504px |
+| ----- | ----------------------- | ---------------------- |
+| V3    | 119 + 22 | 46 + 5 |
+| V3.1  | 121 + 25 | 48 + 6 |
 
-Again, the results for the v3 model using 1008px are included as it runs much slower when using the v1/v2 default sizing.
+Here, the results for v3/v3.1 are shown only for the native (1008px) resolution. As with image segmentation, these models run much slower at 1024px.
+
+It's worth noting that the tracking times are the same across all v2 models because they use the same size modules for tracking and mask predictions (only the image encoders differ). SAMv3.0 uses the same tracking modules as v2, but ends up slower because the image encoder uses a smaller patch size, leading to higher-resolution memory encodings (72x72 SAMv3 vs. 64x64 for SAMv2). The SAMv3.1 model introduces 'multiplexing' during video segmentation, which leads to increases in the time taken to generate masks and encode memory tokens, hence the small tracking slow down compared to v3.0.
+
+For all models, except v3.1, the tracking time scales linearly with the number of tracked objects. For v3.1, the model can handle 1 to 16 objects in a single batch. So for example, if 30 objects were being tracked, the v2-tiny model would require a total of 463ms (13 + 15 * 30) per frame, while v3.1 could treat this as two batches of 16 for a total 171ms (121 + 25 * 2).
 
 ## Video Segmentation (from mask)
 
-_(Supports SAMv2, SAMv3)_
+_(Supports SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/video_segmentation_from_mask.py)
 
 This is a variation of the basic video segmentation example, but uses a mask prompt to begin tracking. Both a binary mask and corresponding image (i.e. the RGB image from which the mask was generated) must be provided, and replaces the need to provide box or point prompts. Note that the mask & corresponding image don't need to be from the video! Mixing the mask image and video can give results similar to the [video with image priors](https://github.com/heyoeyo/muggled_sam/tree/main/experiments#video-with-image-priors) experimental script.
 
 ## Video Segmentation (Multi-object)
 
-_(Supports SAMv2, SAMv3)_
+_(Supports SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/video_segmentation_multiobj.py)
 
 This is an extension of the more basic video segmentation script, which shows how multiple objects can be segmented/tracked through a video. For the sake of demonstration, this example works by having all prompts known ahead of time, but of course they could be generated dynamically (e.g. by an object detection model). No results are saved from this script, but the combined mask results are displayed and the corresponding code for generating the display output can hopefully provide ideas about how to handle the model outputs for other use cases.
 
 The prompts that are hard-coded into this example script are set up to track a few horses from a short video by [Adrian Hoparda](https://www.pexels.com/@adrian-hoparda-1684220/) which can be freely downloaded:
 https://www.pexels.com/video/horses-running-on-grassland-4215784/
 
+## Video Segmentation (multiplexed)
+
+_(Supports SAMv3.1 only)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/video_segmentation_multiplexed.py)
+
+This is a special variation of multi-object segmentation using 'multiplexing' introduced with the [SAMv3.1 model update](https://github.com/facebookresearch/sam3/blob/main/RELEASE_SAM3p1.md). This allows for up to 16 objects to be tracked 'in parallel' leading to much faster tracking when dealing with large numbers of objects. In this example, tracking begins with object detections (similar to the [tracking from detections](https://github.com/heyoeyo/muggled_sam/tree/main/simple_examples#video-segmentation-from-detections) example) that are then carried forward using multiplexed-tracking. While only the v3.1 model properly supports multiplexing, this script will also run with v3.0 but will instead use regular 'batching' instead of multiplexing, which can be helpful for comparison
+
+For small numbers of objects there isn't a significant speed difference between v3.1 multiplexing and using batching with v3. However batching tends to lead to poor mask quality over time due to the way memory is handled. So even for small numbers of objects, the mask quality of multiplexing is an improvement. For larger numbers of objects, multiplexing provides a significant speed up. The downside of all this is that managing the (multiplexed) tracking data can become far more complex if objects are expected to be added or removed over time (not included in this simple example).
+
 ## Video Segmentation using SAMURAI
 
-_(Supports SAMv2, SAMv3)_
+_(Supports SAMv2, SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/video_segmentation_samurai.py)
 
 This variation of the video segmentation script uses an alternative method of selecting masks during tracking based on the paper: "[SAMURAI: Adapting Segment Anything Model for Zero-Shot Visual Tracking with Motion-Aware Memory](https://arxiv.org/abs/2411.11922)". The idea is to independently track object bounding boxes using a separate tracking method (a [Kalman filter](https://en.wikipedia.org/wiki/Kalman_filter) in this case) and use this to select which masks should be propagated during tracking (as opposed to just using the SAM model IoU predictions). The implementation here is more similar to the description in the paper itself, rather than the [available code](https://github.com/yangchris11/samurai/blob/master/sam2/sam2/utils/kalman_filter.py), but should be [easy to modify](https://github.com/heyoeyo/muggled_sam/blob/3ed04b646005d1b1242b8d07008573ef00815405/muggled_sam/demo_helpers/samurai.py#L22) if needed.
 
@@ -146,7 +170,7 @@ This demo is set up to track only one object, but can be changed to handle multi
 
 ## Video Segmentation from Detections
 
-_(Supports SAMv3)_
+_(Supports SAMv3)_ - [link](https://github.com/heyoeyo/muggled_sam/blob/main/simple_examples/video_segmentation_from_detections.py)
 
 This script uses the new detection capabilities of SAMv3 in order to generate initial objects for tracking. It's a bit like a combination of the tracking from masks & multi-object examples above, but ends up being a fully automatic way of doing video segmentation.
 

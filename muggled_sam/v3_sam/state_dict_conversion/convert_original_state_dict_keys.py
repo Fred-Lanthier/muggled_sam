@@ -132,6 +132,10 @@ def convert_state_dict_keys(
             layernorm_key_hints = ("downscaler.1", "downscaler.4", "img_patch_upscaler.norm")
             new_data = _reshape_layernorm2d(new_key, orig_data, *layernorm_key_hints)
 
+            # Reshape to BxNxC (1x1xC) format for no-pointer embedding (originally 1xC)
+            if new_key == "objptrgen.no_ptr_embed":
+                new_data = new_data.unsqueeze(0)
+
             _update_sd(sam_module_type, orig_key, new_key, new_data)
 
         elif sam_module_type == SAM3ModuleType.memory_encoder:
@@ -166,6 +170,11 @@ def convert_state_dict_keys(
             new_key = _convert_memimgfusion_keys(orig_key)
             if new_key is None:
                 continue
+
+            # Switch from rows-of-tokens (BNC) to image-like shape (BCHW)
+            if "no_mem_embed_bchw" in new_key:
+                new_data = new_data.reshape(1, -1, 1, 1)
+
             _update_sd(sam_module_type, orig_key, new_key, new_data)
 
         elif sam_module_type == SAM3ModuleType.text_encoder:
@@ -313,7 +322,7 @@ def get_module_type(key: str) -> SAM3ModuleType:
         elif key.startswith("tracker.obj_ptr_proj"):
             return SAM3ModuleType.mask_decoder
         elif key.startswith("tracker.mask_downsample"):
-            return SAM3ModuleType.not_used
+            return SAM3ModuleType.mask_decoder
         elif key.startswith("tracker.no_mem"):
             # Catches 'no_mem_embed', 'no_mem_pos_enc'
             return SAM3ModuleType.memory_image_fusion
@@ -538,12 +547,14 @@ def _convert_maskdecoder_keys(key: str) -> None | str:
 
     # Capture object pointer weights (now part of mask decoder, instead of 'parent' model)
     if key == "tracker.no_obj_ptr":
-        return "objptrgen.no_ptr"
+        return "objptrgen.no_ptr_embed"
     elif key.startswith("tracker.obj_ptr_proj"):
         layer_idx = get_nth_integer(key, 0)
         new_idx = 2 * layer_idx
         weight_or_bias = get_suffix_terms(key)
         return f"objptrgen.pointer_mlp.layers.{new_idx}.{weight_or_bias}"
+    elif key.startswith("tracker.mask_downsample"):
+        return key.replace("tracker.mask_downsample", "mask_to_ptr_hint_downsampler")
 
     # Remove original prefix for remaining mask decoder keys
     key = key.removeprefix("tracker.sam_mask_decoder.")
@@ -682,7 +693,7 @@ def _convert_memimgfusion_keys(key: str) -> None | str:
 
     # Capture 'no_mem_embed' which originally belonged to parent SAM model
     if key == "tracker.no_mem_embed":
-        return key.removeprefix("tracker.")
+        return "no_mem_embed_bchw"
 
     # Rename frame position offset embedding
     if key == "tracker.maskmem_tpos_enc":
@@ -693,29 +704,32 @@ def _convert_memimgfusion_keys(key: str) -> None | str:
         return key.replace("tracker.obj_ptr_tpos_proj", "memconcat.ptrposenc.pointer_pos_proj")
 
     # Remove original prefix for remaining 'transformer' keys
-    key = key.removeprefix("tracker.transformer.encoder.")
+    if key.startswith("tracker.transformer.encoder."):
 
-    # Re-name the layers of the transformer (bulk of this model)
-    if key.startswith("layers"):
+        # Update transformer prefix
+        key = key.replace("tracker.transformer.encoder", "fusion_transformer")
 
-        # Handle re-structuring of the fusion transformer layers
-        find_and_replace_lut = {
-            "norm1": "image_selfattn.norm",
-            "norm2": "image_crossattn.norm",
-            "self_attn": "image_selfattn.attn",
-            "cross_attn_image": "image_crossattn.attn",
-            "norm3": "image_mlp.mlp.0",
-            "linear1": "image_mlp.mlp.1",
-            "linear2": "image_mlp.mlp.3",
-        }
-        has_attn_match, targ_str, match_str = find_match_by_lut(key, find_and_replace_lut)
-        if has_attn_match:
-            return key.replace(targ_str, match_str)
+        # Re-name the layers of the transformer (bulk of this model)
+        if key.startswith("fusion_transformer.layers"):
 
-    # Rename final norm layers for clarity
-    # (these are different from the norm layers 'norm1/2/3' inside the transformer)
-    if key.startswith("norm"):
-        return key.replace("norm", "out_norm")
+            # Handle re-structuring of the fusion transformer layers
+            find_and_replace_lut = {
+                "norm1": "image_selfattn.norm",
+                "norm2": "image_crossattn.norm",
+                "self_attn": "image_selfattn.attn",
+                "cross_attn_image": "image_crossattn.attn",
+                "norm3": "image_mlp.mlp.0",
+                "linear1": "image_mlp.mlp.1",
+                "linear2": "image_mlp.mlp.3",
+            }
+            has_attn_match, targ_str, match_str = find_match_by_lut(key, find_and_replace_lut)
+            if has_attn_match:
+                return key.replace(targ_str, match_str)
+
+        # Rename final norm layers for clarity
+        # (these are different from the 'norm1/2/3' in the transformer layers)
+        if key.startswith("fusion_transformer.norm"):
+            return key.replace("norm", "out_norm")
 
     return None
 

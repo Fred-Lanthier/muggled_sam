@@ -313,41 +313,43 @@ class SAMV2Model(nn.Module):
             # For convenience
             lowres_imgenc, *hires_imgenc = encoded_image_features_list
             device, dtype = lowres_imgenc.device, lowres_imgenc.dtype
-            token_h, token_w = lowres_imgenc.shape[2:]
-
-            # Hard-code the object score as being 'high/confident', since we assume the given mask is accurate
-            obj_score = torch.tensor(100.0, device=device, dtype=dtype)
+            token_hw = lowres_imgenc.shape[2:]
 
             # Force input into a boolean mask & convert to torch tensor
             if isinstance(mask_image, ndarray):
-                if mask_image.dtype != np.bool:
-                    mask_image = mask_image > 0
                 mask_tensor = torch.tensor(mask_image, device=device, dtype=dtype)
             elif isinstance(mask_image, Tensor):
-                if mask_image.dtype != torch.bool:
-                    mask_image = mask_image > 0
                 mask_tensor = mask_image.to(device=device, dtype=dtype)
             assert isinstance(mask_tensor, Tensor), "Unsupported mask type! Must be a numpy array or torch tensor"
 
             # Make sure we get a mask with shape: BxNxHxW
             if mask_tensor.ndim == 2:
-                # Convert HxW -> 1x1xHxW
-                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  #  HxW -> 1x1xHxW
             elif mask_tensor.ndim == 3 and mask_tensor.shape[-1] <= 3:
-                # Convert (opencv image format) HxWxC -> 1x1xHxW
-                mask_tensor = mask_tensor[:, :, 0].unsqueeze(0).unsqueeze(0)
+                mask_tensor = mask_tensor[:, :, 0].unsqueeze(0).unsqueeze(0)  # HxWxC -> 1x1xHxW
             elif mask_tensor.ndim == 3:
-                # Convert BxHxW -> Bx1xHxW
-                mask_tensor = mask_tensor.unsqueeze(1)
-            assert (
-                mask_tensor.ndim == 4 and mask_tensor.shape[1] == 1
-            ), "Unsupported mask shape, must be: HxW, HxWxC, BxHxW or Bx1xHxW"
+                mask_tensor = mask_tensor.unsqueeze(1)  # BxHxW -> Bx1xHxW
+            assert mask_tensor.ndim == 4, "Unsupported mask shape, must be: HxW, HxWxC, BxHxW or Bx1xHxW"
 
-            # Scale input to correct size before encoding
-            mask_tensor = nn.functional.interpolate(mask_tensor, size=(4 * token_h, 4 * token_w))
-            memory_encoding = self.memory_encoder(lowres_imgenc, mask_tensor, obj_score, is_prompt_encoding=True)
+            # Try to force Bx1xHxW shape
+            mask_b, mask_n, mask_h, mask_w = mask_tensor.shape
+            if mask_b == 1 and mask_n > 1:
+                mask_tensor = mask_tensor.permute(1, 0, 2, 3)
+                mask_b, mask_n, mask_h, mask_w = mask_tensor.shape
+            assert mask_tensor.shape[1] == 1, "Mask shape error! Expecting '1' in shape index 1, eg. Bx1xHxW"
 
-        return memory_encoding
+            # Make special-case pointer from mask, since we don't normally get one without prompting
+            # https://github.com/facebookresearch/sam2/blob/2b90b9f5ceec907a1c18123530e92e794ad901a4/sam2/modeling/sam2_base.py#L442
+            pad_prompt_enc = self.prompt_encoder.create_padding_point_encoding()
+            grid_posenc = self.coordinate_encoder.get_grid_position_encoding(token_hw)
+            ptrs_b1c = self.mask_decoder.make_pointer_from_mask(
+                encoded_image_features_list, pad_prompt_enc, grid_posenc, mask_tensor
+            )
+
+            # Generate memory encoding from mask
+            memory_encoding = self.memory_encoder(lowres_imgenc, mask_tensor, None, is_prompt_encoding=True)
+
+        return memory_encoding, ptrs_b1c
 
     # .................................................................................................................
 
@@ -437,6 +439,34 @@ class SAMV2Model(nn.Module):
     def check_have_prompts(self, box_tlbr_norm_list, fg_xy_norm_list, bg_xy_norm_list) -> bool:
         """Helper used to check if there are any prompts"""
         return self.prompt_encoder.check_have_prompts(box_tlbr_norm_list, fg_xy_norm_list, bg_xy_norm_list)
+
+    # .................................................................................................................
+
+    def prepare_image_batch(
+        self,
+        images_bgr_list: list[ndarray],
+        max_side_length: int | None = None,
+        use_square_sizing: bool = True,
+    ) -> Tensor:
+        """
+        Helper used to convert BGR image (from opencv) into the tensor format needed for image encoding
+        Expects a list of numpy arrays (BGR images) as input. Returns a single tensor of shape: BxCxHxW
+        """
+
+        # Prepare each image individually
+        img_tensors_list = []
+        for image_bgr in images_bgr_list:
+            img_tensor_bchw = self.image_encoder.prepare_image(image_bgr, max_side_length, use_square_sizing)
+            img_tensors_list.append(img_tensor_bchw)
+
+        # Check that all images have the same size if square sizing isn't used
+        if not use_square_sizing:
+            all_h_list = [img.shape[2] for img in img_tensors_list]
+            all_w_list = [img.shape[3] for img in img_tensors_list]
+            assert all(all_h_list[0] == h for h in all_h_list), "Mismatched image heights (different aspect ratios)"
+            assert all(all_w_list[0] == w for w in all_w_list), "Mismatched image widths (different aspect ratios)"
+
+        return torch.concat(img_tensors_list, dim=0)
 
     # .................................................................................................................
 
