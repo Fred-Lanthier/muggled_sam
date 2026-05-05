@@ -23,8 +23,8 @@ from muggled_sam.make_sam import make_sam_from_state_dict
 
 # Define pathing & device usage
 initial_frame_index = 0
-video_path = "/path/to/video.mp4"
-model_path = "/path/to/samv2_model.pth"
+video_path = "/home/flanthier/Github/sam3/assets/videos/bedroom.mp4"
+model_path = "/home/flanthier/.cache/huggingface/hub/models--facebook--sam3/snapshots/2afe64078f4420bdfbc063162d1336003efadc81/sam3.pt"
 device, dtype = "cpu", torch.float32
 if torch.cuda.is_available():
     device, dtype = "cuda", torch.bfloat16

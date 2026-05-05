@@ -30,3 +30,7 @@ training/_*
 training/config/
 training/*.json
 training/*.txt
+
+# Video
+*.mp4
+*.avi
