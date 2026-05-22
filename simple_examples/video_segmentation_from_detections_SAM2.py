@@ -327,9 +327,9 @@ def tracker_worker(track_model, cam, det_queue, shared_state, prompts_ref, shutd
                         break
 
                 raw_mask = new_masks[0, i]
-                init_mem = track_model.initialize_from_mask(src_enc, raw_mask > 0)
+                init_mem, init_ptr = track_model.initialize_from_mask(src_enc, raw_mask > 0)
                 obj_mem = SAMVideoObjectResults.create()
-                obj_mem.store_prompt_result(frame_idx, init_mem)
+                obj_mem.store_prompt_result(frame_idx, init_mem, init_ptr)
 
                 if reused_ghost is not None:
                     obj = TrackedObject(
